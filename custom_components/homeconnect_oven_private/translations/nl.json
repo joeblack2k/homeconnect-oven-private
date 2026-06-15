@@ -1,0 +1,32 @@
+{
+  "config": {
+    "abort": {
+      "reauth_successful": "Herautorisatie is gelukt",
+      "single_instance_allowed": "Er wordt maar een Home Connect Oven Private configuratie ondersteund"
+    },
+    "error": {
+      "private_auth_failed": "Private oven autorisatie is mislukt. Start de flow opnieuw en plak de volledige laatste QR callback-URL."
+    },
+    "step": {
+      "user": {
+        "title": "Private oven media verbinden",
+        "description": "Open de private Home Connect mobiele autorisatie-URL, log in en plak daarna de laatste `https://qr.home-connect.com/authorize/prod/?code=...` callback-URL hier.\n\n{auth_url}",
+        "data": {
+          "callback_url": "Laatste QR callback-URL"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opties",
+        "data": {
+          "poll_interval": "Snapshot poll-interval (seconden)",
+          "diagnostic_sensors": "Diagnostische sensoren inschakelen",
+          "video_download_dir": "Video downloadmap"
+        }
+      }
+    }
+  }
+}

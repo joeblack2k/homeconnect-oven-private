@@ -1,0 +1,15 @@
+{
+  "domain": "homeconnect_oven_private",
+  "name": "Home Connect Oven Private",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/joeblack2k/homeconnect-oven-private",
+  "integration_type": "device",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/joeblack2k/homeconnect-oven-private/issues",
+  "loggers": [
+    "custom_components.homeconnect_oven_private"
+  ],
+  "requirements": [],
+  "version": "0.1.0"
+}

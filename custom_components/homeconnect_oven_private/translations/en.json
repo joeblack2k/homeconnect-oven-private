@@ -1,0 +1,32 @@
+{
+  "config": {
+    "abort": {
+      "reauth_successful": "Re-authentication was successful",
+      "single_instance_allowed": "Only one Home Connect Oven Private entry is supported"
+    },
+    "error": {
+      "private_auth_failed": "Private oven authorization failed. Start the flow again and paste the full final QR callback URL."
+    },
+    "step": {
+      "user": {
+        "title": "Connect private oven media",
+        "description": "Open the private Home Connect mobile authorization URL, sign in, then paste the final `https://qr.home-connect.com/authorize/prod/?code=...` callback URL here.\n\n{auth_url}",
+        "data": {
+          "callback_url": "Final QR callback URL"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options",
+        "data": {
+          "poll_interval": "Snapshot poll interval (seconds)",
+          "diagnostic_sensors": "Enable diagnostic sensors",
+          "video_download_dir": "Video download directory"
+        }
+      }
+    }
+  }
+}

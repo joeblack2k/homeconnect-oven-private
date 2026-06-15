@@ -1,0 +1,23 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile Python
+        run: python3 -m compileall custom_components/homeconnect_oven_private tools
+      - name: Validate JSON
+        run: |
+          python3 -m json.tool custom_components/homeconnect_oven_private/manifest.json >/dev/null
+          python3 -m json.tool custom_components/homeconnect_oven_private/strings.json >/dev/null
+          python3 -m json.tool custom_components/homeconnect_oven_private/translations/en.json >/dev/null
+          python3 -m json.tool custom_components/homeconnect_oven_private/translations/nl.json >/dev/null
+          python3 -m json.tool hacs.json >/dev/null

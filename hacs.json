@@ -1,0 +1,10 @@
+{
+  "name": "Home Connect Oven Private",
+  "content_in_root": false,
+  "domains": [
+    "homeconnect_oven_private"
+  ],
+  "filename": false,
+  "homeassistant": "2025.1.0",
+  "render_readme": true
+}

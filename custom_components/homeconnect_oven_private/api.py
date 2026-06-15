@@ -1,0 +1,460 @@
+"""Private Home Connect mobile API helpers for oven media."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import secrets
+import time
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse
+
+from aiohttp import ClientResponse, ClientResponseError, ClientSession
+from homeassistant.helpers.storage import Store
+
+from .const import (
+    ENDPOINT_AUTHORIZE,
+    ENDPOINT_TOKEN,
+    OAUTH_BASE,
+    PKCE_EXPIRY_SECONDS,
+    PRIVATE_ACCOUNT_CAMERA_ACCEPTS,
+    PRIVATE_ACCOUNT_CAMERA_ENDPOINT,
+    PRIVATE_API_HOST,
+    PRIVATE_CLIENT_ID,
+    PRIVATE_PROBE_STORE_KEY,
+    PRIVATE_PROBE_STORE_VERSION,
+    PRIVATE_REDIRECT_URI,
+    PRIVATE_SCOPES,
+    PRIVATE_TOKEN_STORE_KEY,
+    PRIVATE_TOKEN_STORE_VERSION,
+    PROBE_ROUTE_DEFINITIONS,
+)
+
+
+class PrivateApiError(RuntimeError):
+    """Base exception for private mobile API failures."""
+
+
+class PrivateAuthRequiredError(PrivateApiError):
+    """Raised when private auth is missing."""
+
+
+class PrivateAuthExpiredError(PrivateApiError):
+    """Raised when private auth can no longer be refreshed."""
+
+
+@dataclass(slots=True)
+class OvenInfo:
+    """Known oven account/device information."""
+
+    private_ha_id: str
+    public_ha_id: str | None = None
+    model: str | None = None
+    name: str | None = None
+    has_camera: bool = True
+
+
+@dataclass(slots=True)
+class SnapshotMedia:
+    """Latest still snapshot metadata."""
+
+    private_ha_id: str
+    content_type: str
+    hash_value: str | None
+    identifier: str
+    media_type: str
+    object_detection_identifier: str | None
+    preview_identifier: str | None
+    timestamp_ms: int
+    upload_status: str | None
+    position: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class VideoProbe:
+    """Outcome of probing private oven video support."""
+
+    private_ha_id: str
+    available: bool
+    content_type: str | None = None
+    identifier: str | None = None
+    media_type: str | None = None
+    timestamp_ms: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    route_statuses: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+class MobilePrivateAuth:
+    """Manage PKCE auth and token persistence for the private mobile API."""
+
+    def __init__(self, hass, entry_id: str, websession: ClientSession) -> None:
+        self._websession = websession
+        self._token_store = Store(
+            hass,
+            version=PRIVATE_TOKEN_STORE_VERSION,
+            key=f"{PRIVATE_TOKEN_STORE_KEY}_{entry_id}",
+            private=True,
+        )
+        self._probe_store = Store(
+            hass,
+            version=PRIVATE_PROBE_STORE_VERSION,
+            key=f"{PRIVATE_PROBE_STORE_KEY}_{entry_id}",
+            private=True,
+        )
+        self._data: dict[str, Any] = {}
+        self._probe_data: dict[str, Any] = {}
+
+    async def async_initialize(self) -> None:
+        """Load token and probe state."""
+        self._data = await self._token_store.async_load() or {}
+        self._probe_data = await self._probe_store.async_load() or {}
+
+    def export_state(self) -> dict[str, Any]:
+        """Return the raw persisted state for migration."""
+        return dict(self._data)
+
+    async def async_import_state(self, state: dict[str, Any]) -> None:
+        """Replace the current persisted token state."""
+        self._data = dict(state)
+        await self._async_save_token_store()
+
+    @property
+    def is_configured(self) -> bool:
+        """Return whether a refresh token exists."""
+        token = self._data.get("token") or {}
+        return bool(token.get("refresh_token"))
+
+    def debug_state(self) -> dict[str, Any]:
+        """Return a redacted auth state for diagnostics."""
+        token = self._data.get("token") or {}
+        pkce = self._data.get("pkce") or {}
+        return {
+            "has_access_token": bool(token.get("access_token")),
+            "has_refresh_token": bool(token.get("refresh_token")),
+            "expires_at": token.get("expires_at"),
+            "has_pending_pkce": bool(pkce.get("state")),
+            "pending_pkce_created_at": pkce.get("created_at"),
+        }
+
+    async def async_build_authorize_url(self) -> str:
+        """Build a fresh mobile PKCE authorize URL."""
+        verifier = _generate_code_verifier()
+        challenge = _generate_code_challenge(verifier)
+        state = f"hcapp-{secrets.token_urlsafe(18)}"
+        self._data["pkce"] = {
+            "code_verifier": verifier,
+            "created_at": int(time.time()),
+            "state": state,
+        }
+        await self._async_save_token_store()
+
+        params = {
+            "client_id": PRIVATE_CLIENT_ID,
+            "redirect_uri": PRIVATE_REDIRECT_URI,
+            "response_type": "code",
+            "scope": PRIVATE_SCOPES,
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+        return f"{OAUTH_BASE}{ENDPOINT_AUTHORIZE}?{urlencode(params)}"
+
+    async def async_exchange_callback_url(self, callback_url: str) -> None:
+        """Exchange the QR callback URL into a refresh token."""
+        code, returned_state = _extract_code_and_state(callback_url)
+        pkce = self._data.get("pkce") or {}
+        created_at = int(pkce.get("created_at", 0) or 0)
+        if not pkce.get("code_verifier") or not pkce.get("state"):
+            raise PrivateApiError("No pending private auth session found.")
+        if created_at and (time.time() - created_at) > PKCE_EXPIRY_SECONDS:
+            raise PrivateApiError("The private auth session expired. Start it again.")
+        if returned_state and returned_state != pkce["state"]:
+            raise PrivateApiError("The private auth callback state does not match.")
+
+        payload = await self._async_form_post(
+            f"{OAUTH_BASE}{ENDPOINT_TOKEN}",
+            {
+                "grant_type": "authorization_code",
+                "client_id": PRIVATE_CLIENT_ID,
+                "code": code,
+                "redirect_uri": PRIVATE_REDIRECT_URI,
+                "code_verifier": pkce["code_verifier"],
+            },
+        )
+        self._data["token"] = _normalize_token_payload(payload)
+        self._data.pop("pkce", None)
+        await self._async_save_token_store()
+
+    async def async_get_access_token(self) -> str:
+        """Return a valid access token with one refresh retry."""
+        token = self._data.get("token") or {}
+        refresh_token = token.get("refresh_token")
+        access_token = token.get("access_token")
+        expires_at = int(token.get("expires_at", 0) or 0)
+
+        if not refresh_token:
+            raise PrivateAuthRequiredError("Private oven auth is not configured.")
+
+        if access_token and (expires_at - time.time()) >= 120:
+            return access_token
+
+        last_error: Exception | None = None
+        for _ in range(2):
+            try:
+                payload = await self._async_form_post(
+                    f"{OAUTH_BASE}{ENDPOINT_TOKEN}",
+                    {
+                        "grant_type": "refresh_token",
+                        "client_id": PRIVATE_CLIENT_ID,
+                        "refresh_token": refresh_token,
+                    },
+                )
+            except Exception as err:  # noqa: BLE001
+                last_error = err
+                self._data.get("token", {}).pop("access_token", None)
+                continue
+
+            token = _normalize_token_payload(payload)
+            self._data["token"] = token
+            await self._async_save_token_store()
+            return token["access_token"]
+
+        raise PrivateAuthExpiredError("Private oven auth refresh failed.") from last_error
+
+    async def async_save_probe_results(self, data: dict[str, Any]) -> None:
+        """Persist probe information for diagnostics."""
+        self._probe_data = data
+        await self._probe_store.async_save(data)
+
+    def get_probe_results(self) -> dict[str, Any]:
+        """Return the most recently saved probe results."""
+        return self._probe_data
+
+    async def _async_form_post(self, url: str, data: dict[str, str]) -> dict[str, Any]:
+        """POST form data and decode JSON."""
+        async with self._websession.post(url, data=data) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _async_save_token_store(self) -> None:
+        """Persist token data."""
+        await self._token_store.async_save(self._data)
+
+
+class AsyncMobilePrivateApi:
+    """Wrapper around the private Home Connect mobile API."""
+
+    def __init__(self, auth: MobilePrivateAuth, websession: ClientSession) -> None:
+        self._auth = auth
+        self._websession = websession
+
+    @property
+    def is_configured(self) -> bool:
+        """Return whether the private token is available."""
+        return self._auth.is_configured
+
+    def debug_state(self) -> dict[str, Any]:
+        """Return auth state for diagnostics."""
+        return self._auth.debug_state()
+
+    def get_probe_results(self) -> dict[str, Any]:
+        """Return saved probe results."""
+        return self._auth.get_probe_results()
+
+    async def async_build_authorize_url(self) -> str:
+        """Build a PKCE login URL."""
+        return await self._auth.async_build_authorize_url()
+
+    async def async_exchange_callback_url(self, callback_url: str) -> None:
+        """Exchange the final QR callback URL."""
+        await self._auth.async_exchange_callback_url(callback_url)
+
+    async def async_request(self, method: str, endpoint: str, **kwargs: Any) -> ClientResponse:
+        """Make an authenticated request to the private API host."""
+        token = await self._auth.async_get_access_token()
+        headers = dict(kwargs.pop("headers", {}))
+        headers["Authorization"] = f"Bearer {token}"
+        return await self._websession.request(
+            method,
+            f"{PRIVATE_API_HOST}{endpoint}",
+            headers=headers,
+            **kwargs,
+        )
+
+    async def async_list_ovens(self) -> list[OvenInfo]:
+        """Discover ovens from the account camera endpoint."""
+        last_error: Exception | None = None
+        for accept in PRIVATE_ACCOUNT_CAMERA_ACCEPTS:
+            try:
+                response = await self.async_request(
+                    "GET",
+                    PRIVATE_ACCOUNT_CAMERA_ENDPOINT,
+                    headers={"Accept": accept},
+                )
+                response.raise_for_status()
+                payload = await response.json()
+                response.close()
+                ovens: list[OvenInfo] = []
+                for item in payload.get("data") or []:
+                    private_ha_id = str(item.get("haId") or "")
+                    if not private_ha_id:
+                        continue
+                    ovens.append(
+                        OvenInfo(
+                            private_ha_id=private_ha_id,
+                            public_ha_id=f"{private_ha_id}-001",
+                            name=f"Home Connect Oven {private_ha_id[-6:]}",
+                        )
+                    )
+                return ovens
+            except Exception as err:  # noqa: BLE001
+                last_error = err
+        raise PrivateApiError("Unable to discover ovens from account/camera.") from last_error
+
+    async def async_get_latest_snapshot(self, private_ha_id: str) -> SnapshotMedia | None:
+        """Return the latest still snapshot metadata for an oven."""
+        response = await self.async_request(
+            "GET",
+            PROBE_ROUTE_DEFINITIONS["snapshot_latest_image"].format(ha_id=private_ha_id),
+        )
+        response.raise_for_status()
+        payload = await response.json()
+        response.close()
+        items = payload.get("items") or []
+        if not items:
+            return None
+
+        latest = max(items, key=lambda item: int(item.get("timestamp", 0) or 0))
+        hash_data = latest.get("hash") or {}
+        return SnapshotMedia(
+            private_ha_id=private_ha_id,
+            content_type=str(latest.get("mediaType") or "image/jpeg"),
+            hash_value=hash_data.get("value"),
+            identifier=str(latest["identifier"]),
+            media_type=str(latest.get("type") or "image"),
+            object_detection_identifier=latest.get("objectDetectionImageId"),
+            preview_identifier=latest.get("previewImageIdentifier"),
+            timestamp_ms=int(latest.get("timestamp", 0) or 0),
+            upload_status=latest.get("uploadStatus"),
+            position=latest.get("position"),
+            metadata=_metadata_list_to_dict(latest.get("metaData") or []),
+        )
+
+    async def async_probe_latest_video(self, private_ha_id: str) -> VideoProbe:
+        """Probe candidate private routes for oven video media."""
+        route_statuses: dict[str, dict[str, Any]] = {}
+        for key in ("snapshot_latest_video", "snapshot_gallery", "media_latest_video", "media_latest"):
+            endpoint = PROBE_ROUTE_DEFINITIONS[key].format(ha_id=private_ha_id)
+            try:
+                response = await self.async_request("GET", endpoint)
+                status = response.status
+                content_type = response.headers.get("Content-Type")
+                route_statuses[key] = {"status": status, "content_type": content_type}
+                if status >= 400:
+                    body = await response.text()
+                    route_statuses[key]["body"] = body[:500]
+                    response.close()
+                    continue
+
+                if content_type and "json" in content_type:
+                    payload = await response.json()
+                    response.close()
+                    route_statuses[key]["body"] = payload
+                    items = payload.get("items") or []
+                    if items:
+                        latest = max(items, key=lambda item: int(item.get("timestamp", 0) or 0))
+                        probe = VideoProbe(
+                            private_ha_id=private_ha_id,
+                            available=True,
+                            content_type=str(latest.get("mediaType") or content_type),
+                            identifier=latest.get("identifier"),
+                            media_type=str(latest.get("type") or "video"),
+                            timestamp_ms=int(latest.get("timestamp", 0) or 0),
+                            metadata=_metadata_list_to_dict(latest.get("metaData") or []),
+                            route_statuses=route_statuses,
+                        )
+                        await self._auth.async_save_probe_results(
+                            {"video_probe": {private_ha_id: probe.route_statuses}}
+                        )
+                        return probe
+                    continue
+
+                data = await response.read()
+                response.close()
+                route_statuses[key]["binary_length"] = len(data)
+                if data:
+                    probe = VideoProbe(
+                        private_ha_id=private_ha_id,
+                        available=True,
+                        content_type=content_type,
+                        media_type="video",
+                        route_statuses=route_statuses,
+                    )
+                    await self._auth.async_save_probe_results(
+                        {"video_probe": {private_ha_id: probe.route_statuses}}
+                    )
+                    return probe
+            except ClientResponseError as err:
+                route_statuses[key] = {"status": err.status, "error": str(err)}
+            except Exception as err:  # noqa: BLE001
+                route_statuses[key] = {"status": None, "error": str(err)}
+
+        await self._auth.async_save_probe_results(
+            {"video_probe": {private_ha_id: route_statuses}}
+        )
+        return VideoProbe(private_ha_id=private_ha_id, available=False, route_statuses=route_statuses)
+
+    async def async_download_media(self, private_ha_id: str, media_identifier: str) -> tuple[bytes, str]:
+        """Download a private media object."""
+        response = await self.async_request(
+            "GET",
+            f"/api/media/v1/{private_ha_id}/media/{media_identifier}",
+        )
+        response.raise_for_status()
+        data = await response.read()
+        content_type = response.headers.get("Content-Type", "application/octet-stream")
+        response.close()
+        return data, content_type
+
+
+def _generate_code_verifier() -> str:
+    raw = secrets.token_bytes(48)
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _generate_code_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _extract_code_and_state(callback_url: str) -> tuple[str, str | None]:
+    parsed = urlparse(callback_url)
+    params = parse_qs(parsed.query)
+    error = params.get("error", [None])[0]
+    if error:
+        description = params.get("error_description", [""])[0]
+        raise PrivateApiError(f"Private authorization failed: {error} {description}".strip())
+    code = params.get("code", [None])[0]
+    state = params.get("state", [None])[0]
+    if not code:
+        raise PrivateApiError("No authorization code found in callback URL.")
+    return code, state
+
+
+def _normalize_token_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    fetched_at = int(time.time())
+    normalized = dict(payload)
+    normalized["fetched_at"] = fetched_at
+    if "expires_in" in payload:
+        normalized["expires_at"] = fetched_at + int(payload["expires_in"])
+    return normalized
+
+
+def _metadata_list_to_dict(metadata: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        item["key"]: item.get("value")
+        for item in metadata
+        if isinstance(item, dict) and item.get("key")
+    }
