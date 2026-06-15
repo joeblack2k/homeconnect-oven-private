@@ -24,7 +24,8 @@
         "data": {
           "poll_interval": "Snapshot poll-interval (seconden)",
           "diagnostic_sensors": "Diagnostische sensoren inschakelen",
-          "video_download_dir": "Video downloadmap"
+          "video_download_dir": "Video downloadmap",
+          "local_timelapse_fps": "Beeldsnelheid lokale timelapse MP4"
         }
       }
     }

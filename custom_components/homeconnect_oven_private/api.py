@@ -86,6 +86,25 @@ class VideoProbe:
     route_statuses: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class OvenNotification:
+    """Notification-center item emitted for an oven."""
+
+    private_ha_id: str
+    identifier: str
+    key: str
+    title: str | None
+    description: str | None
+    created_at: str | None
+    state: str | None
+    level: str | None
+    category: str | None
+    channels: list[str] = field(default_factory=list)
+    read: bool | None = None
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
 class MobilePrivateAuth:
     """Manage PKCE auth and token persistence for the private mobile API."""
 
@@ -418,6 +437,44 @@ class AsyncMobilePrivateApi:
         response.close()
         return data, content_type
 
+    async def async_get_oven_notifications(
+        self,
+        private_ha_id: str,
+        accept_language: str,
+    ) -> list[OvenNotification]:
+        """Return notification-center entries for one oven.
+
+        The Android app uses these appliance-event notifications for user-facing
+        push messages such as "turn the dish". FCM is only the delivery channel;
+        this endpoint is the reproducible source of the localized content.
+        """
+        response = await self.async_request(
+            "GET",
+            "/accounts/self/notifications?channel=center",
+            headers={
+                "Accept": "application/json",
+                "Accept-Language": accept_language,
+            },
+        )
+        response.raise_for_status()
+        payload = await response.json()
+        response.close()
+
+        notifications: list[OvenNotification] = []
+        items = payload.get("data") if isinstance(payload, dict) else payload
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            appliance = item.get("appliance") or {}
+            if str(appliance.get("haId") or "") != private_ha_id:
+                continue
+            notifications.append(_notification_from_item(private_ha_id, item))
+        return sorted(
+            notifications,
+            key=lambda notification: notification.created_at or "",
+            reverse=True,
+        )
+
 
 def _generate_code_verifier() -> str:
     raw = secrets.token_bytes(48)
@@ -458,3 +515,22 @@ def _metadata_list_to_dict(metadata: list[dict[str, Any]]) -> dict[str, Any]:
         for item in metadata
         if isinstance(item, dict) and item.get("key")
     }
+
+
+def _notification_from_item(private_ha_id: str, item: dict[str, Any]) -> OvenNotification:
+    """Normalize the current notification-center response shape."""
+    return OvenNotification(
+        private_ha_id=private_ha_id,
+        identifier=str(item.get("id") or ""),
+        key=str(item.get("key") or ""),
+        title=item.get("title"),
+        description=item.get("description"),
+        created_at=item.get("creationDate"),
+        state=item.get("state") or item.get("status"),
+        level=item.get("level"),
+        category=item.get("category"),
+        channels=list(item.get("channels") or []),
+        read=item.get("read"),
+        actions=list(item.get("actions") or []),
+        raw=item,
+    )

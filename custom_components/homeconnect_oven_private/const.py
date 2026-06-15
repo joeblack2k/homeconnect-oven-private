@@ -4,7 +4,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "homeconnect_oven_private"
 NAME = "Home Connect Oven Private"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 PLATFORMS = [
     Platform.CAMERA,
@@ -41,17 +41,20 @@ DEFAULT_POLL_INTERVAL = 5
 MIN_POLL_INTERVAL = 5
 DEFAULT_VIDEO_PROBE_INTERVAL = 300
 DEFAULT_VIDEO_DOWNLOAD_DIR = "www/homeconnect_oven_private"
+DEFAULT_LOCAL_TIMELAPSE_FPS = 4
 PKCE_EXPIRY_SECONDS = 900
 
 CONF_CALLBACK_URL = "callback_url"
 CONF_POLL_INTERVAL = "poll_interval"
 CONF_DIAGNOSTIC_SENSORS = "diagnostic_sensors"
 CONF_VIDEO_DOWNLOAD_DIR = "video_download_dir"
+CONF_LOCAL_TIMELAPSE_FPS = "local_timelapse_fps"
 
 OPTION_DEFAULTS = {
     CONF_POLL_INTERVAL: DEFAULT_POLL_INTERVAL,
     CONF_DIAGNOSTIC_SENSORS: False,
     CONF_VIDEO_DOWNLOAD_DIR: DEFAULT_VIDEO_DOWNLOAD_DIR,
+    CONF_LOCAL_TIMELAPSE_FPS: DEFAULT_LOCAL_TIMELAPSE_FPS,
 }
 
 PROBE_ROUTE_DEFINITIONS = {
@@ -62,3 +65,8 @@ PROBE_ROUTE_DEFINITIONS = {
     "media_latest_video": "/api/media/v1/{ha_id}/media/latest?type=video",
 }
 
+TURN_FOOD_NOTIFICATION_KEYS = {
+    "Cooking.Oven.Event.Cavity.001.TurnFoodNow",
+    "Cooking.Oven.Event.Cavity.001.TurnFoodLater",
+    "Cooking.Oven.Event.Cavity.001.TurnFoodNowMeatprobe",
+}

@@ -137,6 +137,12 @@ class HomeConnectPrivateOvenCamera(HomeConnectPrivateOvenEntity, Camera):
             self._image = image_bytes
             self._content_type = content_type
             self._downloaded_identifier = downloaded_identifier
+            await self._manager.async_store_local_timelapse_frame(
+                self._private_ha_id,
+                image_bytes,
+                content_type,
+                snapshot,
+            )
             self._last_error = None
         except PrivateAuthRequiredError:
             self._last_error = "Private oven auth is not configured"

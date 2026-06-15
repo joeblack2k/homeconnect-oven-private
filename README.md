@@ -10,8 +10,10 @@ Implemented:
 
 - private oven still snapshot camera
 - snapshot metadata sensors
+- private oven notification-center sensors
 - private timelapse/video probing
 - button to download the latest timelapse video when the backend actually exposes one
+- local timelapse recording from still snapshots when the backend exposes no video
 - diagnostic sensors, disabled by default
 
 Not shipped yet:
@@ -37,6 +39,7 @@ Those controls are intentionally withheld until their read/write contract is val
 - `poll_interval`: snapshot refresh interval in seconds, minimum `5`
 - `diagnostic_sensors`: enables disabled-by-default technical sensors
 - `video_download_dir`: relative `/config` directory where downloaded timelapse files are stored
+- `local_timelapse_fps`: frame rate used when building a local MP4 timelapse, default `4`
 
 The default download directory is `/config/www/homeconnect_oven_private`, which is served in Home Assistant as `/local/homeconnect_oven_private/...`.
 
@@ -53,6 +56,43 @@ Live validation against `HS958GED1` returned no downloadable timelapse for the p
 
 The integration still exposes timelapse availability and download entities so future backend support shows up without changing the entity model.
 
+When the backend does not expose a downloadable video, the integration can build
+a local timelapse from the still snapshot camera:
+
+1. Press **Start Local Timelapse Recording** while the oven is running.
+2. The integration captures each new still snapshot media id as a JPEG frame.
+3. Press **Stop Local Timelapse Recording** when the cook is done.
+4. Press **Build Local Timelapse** to create `timelapse.mp4` in the configured
+   download directory.
+
+The resulting file is exposed by the `Local Timelapse File` sensor as a Home
+Assistant `/local/...` URL when the configured directory is under `/config/www`.
+MP4 generation uses `ffmpeg` if it is available in the Home Assistant runtime;
+captured frames remain on disk even if MP4 generation is not available.
+
+## Oven notifications
+
+The official Android app push message for turning food is not derived from the
+camera image. APK inspection and live traffic validation show that the app reads
+oven appliance-event notifications from the private notification-center API:
+
+- `GET /accounts/self/notifications?channel=center`
+- required header: `Accept-Language`
+
+For the validated `HS958GED1`, the endpoint returned localized oven events such
+as:
+
+- `Cooking.Oven.Event.Cavity.001.TurnFoodLater`
+- `Cooking.Oven.Event.Cavity.001.TurnFoodNow`
+- `Cooking.Oven.Event.Cavity.001.CloseDoor`
+- `Cooking.Oven.Event.Cavity.001.ProgramFinished`
+
+The component exposes the latest oven notification and the latest turn-food
+notification as read-only sensors. The binary sensors only report `on` when the
+backend itself marks the notification state as `present`; historical
+notifications remain visible through timestamp/message sensors without inventing
+an active state.
+
 ## Live validation
 
 Validated locally in Home Assistant Core `2026.6.3` with a Siemens `HS958GED1`.
@@ -61,6 +101,7 @@ Validated locally in Home Assistant Core `2026.6.3` with a Siemens `HS958GED1`.
 - snapshot payload size was `677993` bytes at `2592x1952`
 - snapshot metadata sensors reported `COMPLETED` upload status, closed door state, and camera temperature
 - `binary_sensor.hs958ged1_latest_timelapse_available` was `off` because no video media was exposed by the probed private endpoints
+- `sensor.hs958ged1_latest_turn_food_message` reported the localized "turn the dish" instruction from the private notification-center endpoint
 
 ## Supported model
 
