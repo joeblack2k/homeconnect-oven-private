@@ -40,6 +40,8 @@ async def async_setup_entry(
 class HomeConnectPrivateOvenCamera(HomeConnectPrivateOvenEntity, Camera):
     """Still snapshot camera backed by the private mobile media API."""
 
+    _attr_should_poll = False
+
     def __init__(
         self,
         manager: HomeConnectPrivateOvenManager,
@@ -116,27 +118,40 @@ class HomeConnectPrivateOvenCamera(HomeConnectPrivateOvenEntity, Camera):
         """Refresh the snapshot on polling."""
         await self._async_refresh_snapshot()
 
-    async def _async_refresh_snapshot(self) -> None:
+    async def _async_refresh_snapshot(self, force_refresh: bool = False) -> None:
         if self._refreshing:
             return
 
         self._refreshing = True
         try:
-            snapshot = await self._manager.async_get_snapshot(self._private_ha_id)
+            snapshot = await self._manager.async_get_snapshot(
+                self._private_ha_id,
+                min_interval=0 if force_refresh else None,
+                force_refresh=force_refresh,
+            )
             self._last_fetch = time.monotonic()
             if snapshot is None:
                 self._last_error = "Private media backend returned no snapshot items"
                 return
 
             self._last_snapshot = snapshot
-            if snapshot.identifier == self._downloaded_identifier and self._image:
+            if not force_refresh and snapshot.identifier == self._downloaded_identifier and self._image:
                 self._last_error = None
                 return
 
-            image_bytes, content_type, downloaded_identifier = await self._async_download_snapshot(snapshot)
+            image_bytes, content_type, downloaded_identifier = await self._async_download_snapshot(
+                snapshot,
+                force_refresh=force_refresh,
+            )
             self._image = image_bytes
             self._content_type = content_type
             self._downloaded_identifier = downloaded_identifier
+            await self._manager.async_store_local_timelapse_frame(
+                self._private_ha_id,
+                image_bytes,
+                content_type,
+                snapshot,
+            )
             self._last_error = None
         except PrivateAuthRequiredError:
             self._last_error = "Private oven auth is not configured"
@@ -148,11 +163,13 @@ class HomeConnectPrivateOvenCamera(HomeConnectPrivateOvenEntity, Camera):
     async def _async_download_snapshot(
         self,
         snapshot: SnapshotMedia,
+        force_refresh: bool = False,
     ) -> tuple[bytes, str, str]:
         try:
             image_bytes, content_type = await self._manager.private_api.async_download_media(
                 self._private_ha_id,
                 snapshot.identifier,
+                force_refresh=force_refresh,
             )
             return image_bytes, _guess_content_type(image_bytes, content_type), snapshot.identifier
         except ClientResponseError:
@@ -162,6 +179,7 @@ class HomeConnectPrivateOvenCamera(HomeConnectPrivateOvenEntity, Camera):
         image_bytes, content_type = await self._manager.private_api.async_download_media(
             self._private_ha_id,
             snapshot.preview_identifier,
+            force_refresh=force_refresh,
         )
         return (
             image_bytes,

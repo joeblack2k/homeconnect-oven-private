@@ -16,8 +16,10 @@ from .api import MobilePrivateAuth, PrivateApiError
 from .const import (
     CONF_CALLBACK_URL,
     CONF_DIAGNOSTIC_SENSORS,
+    CONF_LOCAL_TIMELAPSE_FPS,
     CONF_POLL_INTERVAL,
     CONF_VIDEO_DOWNLOAD_DIR,
+    DEFAULT_LOCAL_TIMELAPSE_FPS,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_VIDEO_DOWNLOAD_DIR,
     DOMAIN,
@@ -101,6 +103,7 @@ class HomeConnectOvenPrivateOptionsFlow(config_entries.OptionsFlowWithConfigEntr
             CONF_POLL_INTERVAL: self.config_entry.options.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL),
             CONF_DIAGNOSTIC_SENSORS: self.config_entry.options.get(CONF_DIAGNOSTIC_SENSORS, False),
             CONF_VIDEO_DOWNLOAD_DIR: self.config_entry.options.get(CONF_VIDEO_DOWNLOAD_DIR, DEFAULT_VIDEO_DOWNLOAD_DIR),
+            CONF_LOCAL_TIMELAPSE_FPS: self.config_entry.options.get(CONF_LOCAL_TIMELAPSE_FPS, DEFAULT_LOCAL_TIMELAPSE_FPS),
         }
         return self.async_show_form(
             step_id="init",
@@ -113,6 +116,10 @@ class HomeConnectOvenPrivateOptionsFlow(config_entries.OptionsFlowWithConfigEntr
                         ),
                         vol.Required(CONF_DIAGNOSTIC_SENSORS): cv.boolean,
                         vol.Required(CONF_VIDEO_DOWNLOAD_DIR): cv.string,
+                        vol.Required(CONF_LOCAL_TIMELAPSE_FPS): vol.All(
+                            int,
+                            vol.Range(min=1, max=60),
+                        ),
                     }
                 ),
                 defaults,

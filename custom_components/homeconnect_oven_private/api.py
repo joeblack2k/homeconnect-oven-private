@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import secrets
@@ -18,8 +19,8 @@ from .const import (
     ENDPOINT_TOKEN,
     OAUTH_BASE,
     PKCE_EXPIRY_SECONDS,
-    PRIVATE_ACCOUNT_CAMERA_ACCEPTS,
-    PRIVATE_ACCOUNT_CAMERA_ENDPOINT,
+    PRIVATE_APPLIANCE_LIST_ACCEPT,
+    PRIVATE_APPLIANCE_LIST_ENDPOINT,
     PRIVATE_API_HOST,
     PRIVATE_CLIENT_ID,
     PRIVATE_PROBE_STORE_KEY,
@@ -86,6 +87,25 @@ class VideoProbe:
     route_statuses: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class OvenNotification:
+    """Notification-center item emitted for an oven."""
+
+    private_ha_id: str
+    identifier: str
+    key: str
+    title: str | None
+    description: str | None
+    created_at: str | None
+    state: str | None
+    level: str | None
+    category: str | None
+    channels: list[str] = field(default_factory=list)
+    read: bool | None = None
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
 class MobilePrivateAuth:
     """Manage PKCE auth and token persistence for the private mobile API."""
 
@@ -105,6 +125,8 @@ class MobilePrivateAuth:
         )
         self._data: dict[str, Any] = {}
         self._probe_data: dict[str, Any] = {}
+        self._refresh_lock = asyncio.Lock()
+        self._refresh_retry_after = 0.0
 
     async def async_initialize(self) -> None:
         """Load token and probe state."""
@@ -189,6 +211,9 @@ class MobilePrivateAuth:
 
     async def async_get_access_token(self) -> str:
         """Return a valid access token with one refresh retry."""
+        if time.monotonic() < self._refresh_retry_after:
+            raise PrivateAuthExpiredError("Private oven auth refresh is temporarily backed off.")
+
         token = self._data.get("token") or {}
         refresh_token = token.get("refresh_token")
         access_token = token.get("access_token")
@@ -200,28 +225,45 @@ class MobilePrivateAuth:
         if access_token and (expires_at - time.time()) >= 120:
             return access_token
 
-        last_error: Exception | None = None
-        for _ in range(2):
-            try:
-                payload = await self._async_form_post(
-                    f"{OAUTH_BASE}{ENDPOINT_TOKEN}",
-                    {
-                        "grant_type": "refresh_token",
-                        "client_id": PRIVATE_CLIENT_ID,
-                        "refresh_token": refresh_token,
-                    },
-                )
-            except Exception as err:  # noqa: BLE001
-                last_error = err
-                self._data.get("token", {}).pop("access_token", None)
-                continue
+        async with self._refresh_lock:
+            token = self._data.get("token") or {}
+            access_token = token.get("access_token")
+            expires_at = int(token.get("expires_at", 0) or 0)
+            if access_token and (expires_at - time.time()) >= 120:
+                return access_token
 
-            token = _normalize_token_payload(payload)
-            self._data["token"] = token
-            await self._async_save_token_store()
-            return token["access_token"]
+            last_error: Exception | None = None
+            for _ in range(2):
+                try:
+                    payload = await self._async_form_post(
+                        f"{OAUTH_BASE}{ENDPOINT_TOKEN}",
+                        {
+                            "grant_type": "refresh_token",
+                            "client_id": PRIVATE_CLIENT_ID,
+                            "refresh_token": refresh_token,
+                        },
+                    )
+                except Exception as err:  # noqa: BLE001
+                    last_error = err
+                    self._data.get("token", {}).pop("access_token", None)
+                    continue
 
-        raise PrivateAuthExpiredError("Private oven auth refresh failed.") from last_error
+                token = _normalize_token_payload(payload)
+                token.setdefault("refresh_token", refresh_token)
+                access_token = token.get("access_token")
+                if not access_token:
+                    last_error = PrivateApiError(
+                        "Private token refresh returned no access token."
+                    )
+                    continue
+
+                self._data["token"] = token
+                self._refresh_retry_after = 0.0
+                await self._async_save_token_store()
+                return access_token
+
+            self._refresh_retry_after = time.monotonic() + 300
+            raise PrivateAuthExpiredError("Private oven auth refresh failed.") from last_error
 
     async def async_save_probe_results(self, data: dict[str, Any]) -> None:
         """Persist probe information for diagnostics."""
@@ -271,53 +313,76 @@ class AsyncMobilePrivateApi:
         """Exchange the final QR callback URL."""
         await self._auth.async_exchange_callback_url(callback_url)
 
-    async def async_request(self, method: str, endpoint: str, **kwargs: Any) -> ClientResponse:
+    async def async_request(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        base_url: str = PRIVATE_API_HOST,
+        **kwargs: Any,
+    ) -> ClientResponse:
         """Make an authenticated request to the private API host."""
         token = await self._auth.async_get_access_token()
         headers = dict(kwargs.pop("headers", {}))
         headers["Authorization"] = f"Bearer {token}"
+        headers.setdefault("User-Agent", "HomeConnect-appStoreNA/12.15.0")
         return await self._websession.request(
             method,
-            f"{PRIVATE_API_HOST}{endpoint}",
+            f"{base_url}{endpoint}",
             headers=headers,
             **kwargs,
         )
 
     async def async_list_ovens(self) -> list[OvenInfo]:
-        """Discover ovens from the account camera endpoint."""
-        last_error: Exception | None = None
-        for accept in PRIVATE_ACCOUNT_CAMERA_ACCEPTS:
-            try:
-                response = await self.async_request(
-                    "GET",
-                    PRIVATE_ACCOUNT_CAMERA_ENDPOINT,
-                    headers={"Accept": accept},
-                )
-                response.raise_for_status()
-                payload = await response.json()
-                response.close()
-                ovens: list[OvenInfo] = []
-                for item in payload.get("data") or []:
-                    private_ha_id = str(item.get("haId") or "")
-                    if not private_ha_id:
-                        continue
-                    ovens.append(
-                        OvenInfo(
-                            private_ha_id=private_ha_id,
-                            public_ha_id=f"{private_ha_id}-001",
-                            name=f"Home Connect Oven {private_ha_id[-6:]}",
-                        )
-                    )
-                return ovens
-            except Exception as err:  # noqa: BLE001
-                last_error = err
-        raise PrivateApiError("Unable to discover ovens from account/camera.") from last_error
+        """Discover ovens from the account appliance list.
 
-    async def async_get_latest_snapshot(self, private_ha_id: str) -> SnapshotMedia | None:
+        The old private BFF route /account/camera stopped working (404), so the
+        public /api/homeappliances list is used with the same mobile token.
+        """
+        response = await self.async_request(
+            "GET",
+            PRIVATE_APPLIANCE_LIST_ENDPOINT,
+            base_url=OAUTH_BASE,
+            headers={"Accept": PRIVATE_APPLIANCE_LIST_ACCEPT},
+        )
+        response.raise_for_status()
+        payload = await response.json()
+        response.close()
+
+        ovens: list[OvenInfo] = []
+        for item in (payload.get("data") or {}).get("homeappliances") or []:
+            if str(item.get("type") or "").lower() != "oven":
+                continue
+            serial = str(item.get("serialnumber") or "")
+            public_ha_id = str(item.get("haId") or "")
+            private_ha_id = serial or public_ha_id.split("-")[0]
+            if not private_ha_id:
+                continue
+            ovens.append(
+                OvenInfo(
+                    private_ha_id=private_ha_id,
+                    public_ha_id=public_ha_id or f"{private_ha_id}-001",
+                    model=item.get("vib"),
+                    name=item.get("name") or f"Home Connect Oven {private_ha_id[-6:]}",
+                )
+            )
+        return ovens
+
+    async def async_get_latest_snapshot(
+        self,
+        private_ha_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> SnapshotMedia | None:
         """Return the latest still snapshot metadata for an oven."""
         response = await self.async_request(
             "GET",
             PROBE_ROUTE_DEFINITIONS["snapshot_latest_image"].format(ha_id=private_ha_id),
+            headers={
+                "Accept": "application/vnd.bsh.hca.v1+json",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
         )
         response.raise_for_status()
         payload = await response.json()
@@ -406,17 +471,223 @@ class AsyncMobilePrivateApi:
         )
         return VideoProbe(private_ha_id=private_ha_id, available=False, route_statuses=route_statuses)
 
-    async def async_download_media(self, private_ha_id: str, media_identifier: str) -> tuple[bytes, str]:
+    async def async_download_media(
+        self,
+        private_ha_id: str,
+        media_identifier: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[bytes, str]:
         """Download a private media object."""
         response = await self.async_request(
             "GET",
             f"/api/media/v1/{private_ha_id}/media/{media_identifier}",
+            headers={
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
         )
         response.raise_for_status()
         data = await response.read()
         content_type = response.headers.get("Content-Type", "application/octet-stream")
         response.close()
         return data, content_type
+
+    async def async_execute_command(
+        self,
+        private_ha_id: str,
+        public_ha_id: str | None,
+        command_key: str,
+        value: Any = True,
+    ) -> dict[str, Any]:
+        """Execute a Home Connect command using the mobile token."""
+        payload = {"data": {"key": command_key, "value": value}}
+        ha_ids = [ha_id for ha_id in (public_ha_id, private_ha_id) if ha_id]
+        attempts: list[dict[str, Any]] = []
+
+        for base_url in (OAUTH_BASE, PRIVATE_API_HOST):
+            for ha_id in dict.fromkeys(ha_ids):
+                endpoint = f"/api/homeappliances/{ha_id}/commands/{command_key}"
+                response = await self.async_request(
+                    "PUT",
+                    endpoint,
+                    base_url=base_url,
+                    json=payload,
+                    headers={
+                        "Accept": "application/vnd.bsh.sdk.v1+json",
+                        "Content-Type": "application/vnd.bsh.sdk.v1+json",
+                    },
+                )
+                status = response.status
+                content_type = response.headers.get("Content-Type")
+                body: Any = None
+                if status >= 400:
+                    body = await response.text()
+                    attempts.append(
+                        {
+                            "base_url": base_url,
+                            "ha_id": ha_id,
+                            "endpoint": endpoint,
+                            "status": status,
+                            "content_type": content_type,
+                            "body": body[:500],
+                        }
+                    )
+                    response.close()
+                    continue
+
+                if content_type and "json" in content_type:
+                    body = await response.json()
+                else:
+                    body = await response.text()
+                response.close()
+                return {
+                    "base_url": base_url,
+                    "ha_id": ha_id,
+                    "endpoint": endpoint,
+                    "status": status,
+                    "content_type": content_type,
+                    "body": body,
+                    "attempts": attempts,
+                }
+
+        raise PrivateApiError(
+            f"Command {command_key} failed for all candidate appliance ids: {attempts}"
+        )
+
+    async def async_get_public_feature(
+        self,
+        private_ha_id: str,
+        public_ha_id: str | None,
+        feature_type: str,
+        key: str,
+    ) -> dict[str, Any]:
+        """Read a public Home Connect status/setting/command feature."""
+        ha_ids = [ha_id for ha_id in (public_ha_id, private_ha_id) if ha_id]
+        attempts: list[dict[str, Any]] = []
+        for ha_id in dict.fromkeys(ha_ids):
+            endpoint = f"/api/homeappliances/{ha_id}/{feature_type}/{key}"
+            response = await self.async_request(
+                "GET",
+                endpoint,
+                base_url=OAUTH_BASE,
+                headers={"Accept": "application/vnd.bsh.sdk.v1+json"},
+            )
+            status = response.status
+            content_type = response.headers.get("Content-Type")
+            if status >= 400:
+                body = await response.text()
+                attempts.append(
+                    {
+                        "ha_id": ha_id,
+                        "endpoint": endpoint,
+                        "status": status,
+                        "content_type": content_type,
+                        "body": body[:500],
+                    }
+                )
+                response.close()
+                continue
+            payload = await response.json()
+            response.close()
+            return {
+                "ha_id": ha_id,
+                "endpoint": endpoint,
+                "status": status,
+                "body": payload,
+                "attempts": attempts,
+            }
+
+        raise PrivateApiError(f"Feature {feature_type}/{key} failed: {attempts}")
+
+    async def async_set_public_setting(
+        self,
+        private_ha_id: str,
+        public_ha_id: str | None,
+        key: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        """Write a public Home Connect setting feature."""
+        payload = {"data": {"key": key, "value": value}}
+        ha_ids = [ha_id for ha_id in (public_ha_id, private_ha_id) if ha_id]
+        attempts: list[dict[str, Any]] = []
+        for ha_id in dict.fromkeys(ha_ids):
+            endpoint = f"/api/homeappliances/{ha_id}/settings/{key}"
+            response = await self.async_request(
+                "PUT",
+                endpoint,
+                base_url=OAUTH_BASE,
+                json=payload,
+                headers={
+                    "Accept": "application/vnd.bsh.sdk.v1+json",
+                    "Content-Type": "application/vnd.bsh.sdk.v1+json",
+                },
+            )
+            status = response.status
+            content_type = response.headers.get("Content-Type")
+            if status >= 400:
+                body = await response.text()
+                attempts.append(
+                    {
+                        "ha_id": ha_id,
+                        "endpoint": endpoint,
+                        "status": status,
+                        "content_type": content_type,
+                        "body": body[:500],
+                    }
+                )
+                response.close()
+                continue
+            body = await response.text()
+            response.close()
+            return {
+                "ha_id": ha_id,
+                "endpoint": endpoint,
+                "status": status,
+                "content_type": content_type,
+                "body": body,
+                "attempts": attempts,
+            }
+
+        raise PrivateApiError(f"Setting {key} write failed: {attempts}")
+
+    async def async_get_oven_notifications(
+        self,
+        private_ha_id: str,
+        accept_language: str,
+    ) -> list[OvenNotification]:
+        """Return notification-center entries for one oven.
+
+        The Android app uses these appliance-event notifications for user-facing
+        push messages such as "turn the dish". FCM is only the delivery channel;
+        this endpoint is the reproducible source of the localized content.
+        """
+        response = await self.async_request(
+            "GET",
+            "/accounts/self/notifications?channel=center",
+            headers={
+                "Accept": "application/json",
+                "Accept-Language": accept_language,
+            },
+        )
+        response.raise_for_status()
+        payload = await response.json()
+        response.close()
+
+        notifications: list[OvenNotification] = []
+        items = payload.get("data") if isinstance(payload, dict) else payload
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            appliance = item.get("appliance") or {}
+            if str(appliance.get("haId") or "") != private_ha_id:
+                continue
+            notifications.append(_notification_from_item(private_ha_id, item))
+        return sorted(
+            notifications,
+            key=lambda notification: notification.created_at or "",
+            reverse=True,
+        )
 
 
 def _generate_code_verifier() -> str:
@@ -458,3 +729,22 @@ def _metadata_list_to_dict(metadata: list[dict[str, Any]]) -> dict[str, Any]:
         for item in metadata
         if isinstance(item, dict) and item.get("key")
     }
+
+
+def _notification_from_item(private_ha_id: str, item: dict[str, Any]) -> OvenNotification:
+    """Normalize the current notification-center response shape."""
+    return OvenNotification(
+        private_ha_id=private_ha_id,
+        identifier=str(item.get("id") or ""),
+        key=str(item.get("key") or ""),
+        title=item.get("title"),
+        description=item.get("description"),
+        created_at=item.get("creationDate"),
+        state=item.get("state") or item.get("status"),
+        level=item.get("level"),
+        category=item.get("category"),
+        channels=list(item.get("channels") or []),
+        read=item.get("read"),
+        actions=list(item.get("actions") or []),
+        raw=item,
+    )

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from aiohttp import ClientResponseError
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
@@ -12,7 +13,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .api import PrivateApiError, PrivateAuthRequiredError
-from .const import CONF_DIAGNOSTIC_SENSORS, DOMAIN
+from .const import CONF_DIAGNOSTIC_SENSORS, DOMAIN, TURN_FOOD_NOTIFICATION_KEYS
+from .const import SETTING_CAMERA_ENABLED, STATUS_CAMERA_STATE
 from .coordinator import HomeConnectPrivateOvenManager
 from .entity import HomeConnectPrivateOvenEntity
 
@@ -30,6 +32,20 @@ SNAPSHOT_SENSOR_TYPES = {
     "image_acquisition_time": {"name": "Image Acquisition Time", "device_class": "timestamp"},
     "latest_timelapse_time": {"name": "Latest Timelapse Time", "device_class": "timestamp"},
     "latest_timelapse_file": {"name": "Latest Timelapse File"},
+    "local_timelapse_frame_count": {"name": "Local Timelapse Frame Count"},
+    "local_timelapse_last_frame_time": {"name": "Local Timelapse Last Frame Time", "device_class": "timestamp"},
+    "local_timelapse_started_time": {"name": "Local Timelapse Started Time", "device_class": "timestamp"},
+    "local_timelapse_skipped_duplicate_count": {"name": "Local Timelapse Skipped Duplicate Count"},
+    "local_timelapse_file": {"name": "Local Timelapse File"},
+    "local_timelapse_error": {"name": "Local Timelapse Error"},
+    "latest_notification_time": {"name": "Latest Notification Time", "device_class": "timestamp"},
+    "latest_notification_key": {"name": "Latest Notification Key"},
+    "latest_notification_title": {"name": "Latest Notification Title"},
+    "latest_notification_description": {"name": "Latest Notification Description"},
+    "latest_notification_state": {"name": "Latest Notification State"},
+    "latest_notification_category": {"name": "Latest Notification Category"},
+    "latest_turn_food_time": {"name": "Latest Turn Food Time", "device_class": "timestamp"},
+    "latest_turn_food_message": {"name": "Latest Turn Food Message"},
 }
 
 DIAGNOSTIC_SENSOR_TYPES = {
@@ -48,6 +64,19 @@ DIAGNOSTIC_SENSOR_TYPES = {
     "latest_timelapse_media_id": "Latest Timelapse Media ID",
 }
 
+CAMERA_FEATURE_SENSOR_TYPES = {
+    "camera_enabled_setting": {
+        "name": "Camera Enabled Setting",
+        "feature_type": "settings",
+        "key": SETTING_CAMERA_ENABLED,
+    },
+    "camera_state": {
+        "name": "Camera State",
+        "feature_type": "status",
+        "key": STATUS_CAMERA_STATE,
+    },
+}
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -62,6 +91,10 @@ async def async_setup_entry(
         entities.extend(
             SnapshotSensor(manager, oven.private_ha_id, key)
             for key in SNAPSHOT_SENSOR_TYPES
+        )
+        entities.extend(
+            CameraFeatureSensor(manager, oven.private_ha_id, key)
+            for key in CAMERA_FEATURE_SENSOR_TYPES
         )
         if entry.options.get(CONF_DIAGNOSTIC_SENSORS):
             entities.extend(
@@ -102,6 +135,12 @@ class SnapshotSensor(HomeConnectPrivateOvenEntity, SensorEntity):
         snapshot = self._manager._snapshots.get(self._private_ha_id)
         video = self._manager.get_video_probe(self._private_ha_id)
         downloaded_video = self._manager.get_downloaded_video(self._private_ha_id)
+        latest_notification = self._manager.get_latest_notification(self._private_ha_id)
+        latest_turn_food = self._manager.get_latest_notification_by_key(
+            self._private_ha_id,
+            TURN_FOOD_NOTIFICATION_KEYS,
+        )
+        local_timelapse = self._manager.get_local_timelapse(self._private_ha_id)
 
         if self._key == "last_snapshot_time":
             return _as_timestamp(snapshot.timestamp_ms if snapshot else None)
@@ -132,6 +171,34 @@ class SnapshotSensor(HomeConnectPrivateOvenEntity, SensorEntity):
             return _as_timestamp(video.timestamp_ms if video else None)
         if self._key == "latest_timelapse_file":
             return downloaded_video.get("url") if downloaded_video else None
+        if self._key == "local_timelapse_frame_count":
+            return local_timelapse.get("frame_count")
+        if self._key == "local_timelapse_last_frame_time":
+            return _as_timestamp(local_timelapse.get("last_frame_at"), seconds=True)
+        if self._key == "local_timelapse_started_time":
+            return _as_timestamp(local_timelapse.get("started_at"), seconds=True)
+        if self._key == "local_timelapse_skipped_duplicate_count":
+            return local_timelapse.get("skipped_duplicate_count")
+        if self._key == "local_timelapse_file":
+            return local_timelapse.get("output_url")
+        if self._key == "local_timelapse_error":
+            return local_timelapse.get("last_error")
+        if self._key == "latest_notification_time":
+            return _parse_iso_timestamp(latest_notification.created_at if latest_notification else None)
+        if self._key == "latest_notification_key":
+            return latest_notification.key if latest_notification else None
+        if self._key == "latest_notification_title":
+            return latest_notification.title if latest_notification else None
+        if self._key == "latest_notification_description":
+            return latest_notification.description if latest_notification else None
+        if self._key == "latest_notification_state":
+            return latest_notification.state if latest_notification else None
+        if self._key == "latest_notification_category":
+            return latest_notification.category if latest_notification else None
+        if self._key == "latest_turn_food_time":
+            return _parse_iso_timestamp(latest_turn_food.created_at if latest_turn_food else None)
+        if self._key == "latest_turn_food_message":
+            return latest_turn_food.description if latest_turn_food else None
         return None
 
     async def async_update(self) -> None:
@@ -139,8 +206,9 @@ class SnapshotSensor(HomeConnectPrivateOvenEntity, SensorEntity):
         try:
             await self._manager.async_get_snapshot(self._private_ha_id)
             await self._manager.async_get_video_probe(self._private_ha_id)
+            await self._manager.async_get_notifications(self._private_ha_id)
             self._last_error = None
-        except (PrivateAuthRequiredError, PrivateApiError) as err:
+        except (ClientResponseError, PrivateAuthRequiredError, PrivateApiError) as err:
             self._last_error = str(err)
 
 
@@ -195,6 +263,53 @@ class DiagnosticSensor(HomeConnectPrivateOvenEntity, SensorEntity):
         await self._manager.async_get_video_probe(self._private_ha_id)
 
 
+class CameraFeatureSensor(HomeConnectPrivateOvenEntity, SensorEntity):
+    """Expose app-discovered public camera setting/status features."""
+
+    _attr_should_poll = True
+
+    def __init__(self, manager: HomeConnectPrivateOvenManager, private_ha_id: str, key: str) -> None:
+        super().__init__(manager, private_ha_id, key)
+        self._key = key
+        self._value: Any = None
+        self._last_error: str | None = None
+        self._raw: dict[str, Any] | None = None
+
+    @property
+    def name(self) -> str:
+        return CAMERA_FEATURE_SENSOR_TYPES[self._key]["name"]
+
+    @property
+    def native_value(self):
+        return self._value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "feature_key": CAMERA_FEATURE_SENSOR_TYPES[self._key]["key"],
+            "feature_type": CAMERA_FEATURE_SENSOR_TYPES[self._key]["feature_type"],
+            "last_error": self._last_error,
+            "raw": self._raw,
+        }
+
+    async def async_update(self) -> None:
+        config = CAMERA_FEATURE_SENSOR_TYPES[self._key]
+        try:
+            result = await self._manager.async_get_public_feature(
+                self._private_ha_id,
+                config["feature_type"],
+                config["key"],
+            )
+            data = (result.get("body") or {}).get("data") or {}
+            self._value = data.get("value")
+            self._raw = data
+            self._last_error = None
+        except Exception as err:  # noqa: BLE001
+            self._value = None
+            self._raw = None
+            self._last_error = str(err)
+
+
 def _as_timestamp(value: int | None, seconds: bool = False):
     if value is None:
         return None
@@ -218,4 +333,13 @@ def _as_float(value: Any) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
+        return None
+
+
+def _parse_iso_timestamp(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
         return None
